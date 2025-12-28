@@ -114,6 +114,7 @@ dmypy.json
 *.hdf5
 *.ckpt
 *.pt
+*.npz
 *.pth
 *.onnx
 
