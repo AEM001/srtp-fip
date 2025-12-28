@@ -121,6 +121,7 @@ dmypy.json
 # Project specific
 ckpt/
 data/*.pt
+data/support_data/
 mydata/processed_final/
 .claude/
 
