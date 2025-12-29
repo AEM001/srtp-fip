@@ -18,7 +18,9 @@
 我通过以下两个步骤解决了这个问题：
 
 1.  **引入 T-Pose 校准 (Calibration)**：
-    *   利用 [1.csv](cci:7://file:///home/albert/code/srtp/FIP_inference/mydata/csv/1.csv:0:0-0:0) 的第一帧（动作1是T-Pose）作为基准。
+    *   利用 [1.csv](cci:7://file:///home/albert/code/srtp/FIP_inference/mydata/csv/1.csv:0:0-0:0) 的第 10 帧到第 60 帧（共50帧）的稳定窗口进行平均。
+    *   跳过前10帧：避开启动时的不稳定数据。
+    *   取样50帧：确保数据足够平滑，消除噪声影响。
     *   强制让这一帧的姿态回归到 **单位矩阵 (Identity)**（即标准的 T-Pose 状态）。
     *   计算出一个 **校准矩阵 (Offset Matrix)**，消除传感器的安装误差。
     *   **通用性**：这个校准矩阵是从 [1.csv](cci:7://file:///home/albert/code/srtp/FIP_inference/mydata/csv/1.csv:0:0-0:0) 算出来的，然后同样应用到 `2.csv` 和 `3.csv`，确保所有文件的坐标系完全统一。
