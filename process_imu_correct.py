@@ -93,31 +93,38 @@ def get_coordinate_transform(imu_id):
 def compute_calibration_offsets(df_tpose, root_id=5):
     """
     Compute calibration rotation matrices from T-pose data.
-    Aligns all sensors to the Root sensor's orientation in T-pose.
-    Assumption: In T-pose, all body parts are 'aligned' in the model's orientation space
-    (i.e., relative rotations are Identity).
+    Aligns all sensors to the Global Identity orientation in T-pose.
+    Assumption: In T-pose, the subject is in the model's zero pose (Identity rotation).
+    
+    Updated: Uses a stable window of frames (skip first 10, use next 50) instead of all data
+    to avoid startup instability.
     """
     print("\nComputing T-pose calibration...")
+    print("  Strategy: Using average of frames 10-60 (stable window)")
     offsets = {}
-    
-    # Get average rotation matrix for Root
-    root_data = df_tpose[df_tpose['imu_id'] == root_id]
-    if len(root_data) == 0:
-        print("Warning: Root IMU not found in calibration data!")
-        return {}
-        
-    # Average rotation for Root (simple average of Euler angles for stability)
-    # Actually, we should calibrate to IDENTITY (Target Global Frame).
-    # In T-pose, we assume the person is standing upright (Root = Identity)
-    # and Limbs are aligned with World axes as per SMPL T-pose (Identity).
     
     # Compute offsets for all IDs to make them Identity in T-pose
     for imu_id in df_tpose['imu_id'].unique():
-        imu_data = df_tpose[df_tpose['imu_id'] == imu_id]
+        # Get data for this IMU, sorted by timestamp
+        imu_data = df_tpose[df_tpose['imu_id'] == imu_id].sort_values('timestamp')
         
-        avg_roll = imu_data['roll'].mean()
-        avg_pitch = imu_data['pitch'].mean()
-        avg_yaw = imu_data['yaw'].mean()
+        # Select stable window: Skip first 10 frames, take next 50
+        # If not enough data, take what we have after skipping
+        start_idx = 10
+        end_idx = 60
+        
+        if len(imu_data) > start_idx:
+            subset = imu_data.iloc[start_idx:min(end_idx, len(imu_data))]
+        else:
+            subset = imu_data # Fallback if very short
+            
+        if len(subset) == 0:
+            print(f"Warning: No data found for IMU {imu_id} in specified window!")
+            continue
+            
+        avg_roll = subset['roll'].mean()
+        avg_pitch = subset['pitch'].mean()
+        avg_yaw = subset['yaw'].mean()
         R_meas = euler_to_rotation_matrix(avg_roll, avg_pitch, avg_yaw)
         
         # We want: R_meas @ R_offset = I (Identity)
@@ -136,93 +143,15 @@ def apply_coordinate_transform(accel, rotation_matrix, imu_id, calibration_matri
     accel_transformed = transform @ accel
     
     # Transform rotation matrix: R_body = R_sensor @ T^T
-    # R maps Local -> Global. 
-    # v_global = R_sensor @ v_sensor
-    # v_body = T @ v_sensor => v_sensor = T^T @ v_body
-    # v_global = R_sensor @ T^T @ v_body
-    # So R_body = R_sensor @ T^T
     rotation_transformed = rotation_matrix @ transform.T
     
     # Apply Calibration: R_final = R_transformed @ R_calib
     if calibration_matrix is not None:
         rotation_transformed = rotation_transformed @ calibration_matrix
-        
-        # Note: We do NOT rotate acceleration by calibration matrix.
-        # Calibration aligns the *Orientation Output* to be Identity.
-        # Acceleration is a physical vector in the body frame.
-        # If we just 'reset' the orientation to Identity, we are effectively
-        # saying "The sensor was mounted with this rotation R_offset relative to the bone".
-        # So we should also rotate the Acceleration vector into the Bone Frame?
-        # v_bone = R_offset.T @ v_sensor_body?
-        # NO. R_final maps Bone -> Global.
-        # R_transformed maps SensorBody -> Global.
-        # R_transformed @ R_calib = R_final.
-        # This implies R_calib maps Bone -> SensorBody?
-        # No, it's a post-multiply.
-        # Let's trace:
-        # v_global = R_transformed @ v_sensor_body.
-        # We want v_global = R_final @ v_bone.
-        # If we define v_bone = v_sensor_body (Sensor is aligned with bone in position, just rotated?),
-        # No, if sensor is rotated, v_bone != v_sensor_body.
-        
-        # If we assume the "Calibration" is correcting for Sensor Mounting Rotation.
-        # R_meas (at T-pose) should be Identity. It is R_err.
-        # We apply R_offset = R_err.T.
-        # So R_final = R_meas @ R_err.T = I.
-        # This Rotation Correction implies the Sensor Frame is rotated relative to Bone Frame.
-        # R_sensor = R_bone @ R_mount.
-        # We want R_bone = R_sensor @ R_mount.T.
-        # This matches our operation if R_mount = R_err.
-        
-        # Does Acceleration need to be rotated?
-        # v_sensor = R_mount.T @ v_bone.
-        # v_bone = R_mount @ v_sensor.
-        # v_bone = R_err @ v_sensor.
-        # So yes, we SHOULD rotate the acceleration vector by the inverse of the calibration matrix?
-        # Wait. R_final = R_sensor @ R_offset.
-        # R_offset = R_mount.T.
-        # So R_bone = R_sensor @ R_mount.T.
-        # And v_bone = R_mount @ v_sensor.
-        # So v_bone = R_offset.T @ v_sensor.
-        
-        # However, in many IMU pipelines, we only calibrate Orientation.
-        # Because 'accel' is used for position/velocity integration in Global Frame.
-        # v_global_acc = R_final @ v_bone_acc.
-        # v_global_acc = (R_sensor @ R_offset) @ (R_offset.T @ v_sensor).
-        # v_global_acc = R_sensor @ v_sensor.
-        # This remains unchanged!
-        # Which is CORRECT. The physical acceleration in global space (Gravity) is invariant.
-        # We are just changing the definition of the "Body Frame".
-        # So we do NOT need to transform the acceleration vector values.
-        # We just compute a new Orientation Matrix for the body.
-        # And the Model uses (Acc, Ori) pairs.
-        # If the Model assumes Acc is in the Body Frame (Local)?
-        # infer_from_csv.py:
-        # acc_root = ori[:, 5:].transpose(-1, -2) @ (acc - acc[:, 5:]).unsqueeze(-1)
-        # It projects (Acc_Global - Acc_Root_Global) into the Root Frame.
-        # Wait. `acc` in the CSV is treated as Global or Local?
-        # The CSV has `accel_x, y, z`.
-        # My code `accel_transformed = transform @ accel`.
-        # This maps Sensor Local -> Body Local.
-        # Is this Body Local treated as Global by the inference script?
-        # "load_csv_to_tensors":
-        # It reads accel.
-        # "acc_root = ori... @ acc".
-        # This implies `acc` is GLOBAL.
-        # Because it projects it *into* Root frame using `ori.T`.
-        # If `acc` was already Local, we wouldn't project it.
-        
-        # So `acc` must be in Global Frame.
-        # BUT `transform @ accel` maps Sensor Local -> Body Local (Aligned with Global).
-        # Wait.
-        # If `transform` maps Sensor Axes to Global Axes (e.g. X->-Y).
-        # Then `transform @ accel_sensor` = `accel_global`.
-        # Correct.
-        # So `accel_transformed` IS Global Acceleration.
-        # And R_transformed IS Body Orientation (Local -> Global).
-        
-        # So we are good. We don't touch accel.
-        pass
+        # Note: We do not rotate acceleration by the calibration matrix because
+        # calibration aligns the sensor's mounting orientation to the bone frame,
+        # but the physical gravity vector (acceleration) is already in the correct 
+        # global frame after the initial coordinate transform.
     
     return accel_transformed, rotation_transformed
 
