@@ -90,53 +90,8 @@ def get_coordinate_transform(imu_id):
     
     return transform
 
-def compute_calibration_offsets(df_tpose, root_id=5):
-    """
-    Compute calibration rotation matrices from T-pose data.
-    Aligns all sensors to the Global Identity orientation in T-pose.
-    Assumption: In T-pose, the subject is in the model's zero pose (Identity rotation).
-    
-    Updated: Uses a stable window of frames (skip first 10, use next 50) instead of all data
-    to avoid startup instability.
-    """
-    print("\nComputing T-pose calibration...")
-    print("  Strategy: Using average of frames 10-60 (stable window)")
-    offsets = {}
-    
-    # Compute offsets for all IDs to make them Identity in T-pose
-    for imu_id in df_tpose['imu_id'].unique():
-        # Get data for this IMU, sorted by timestamp
-        imu_data = df_tpose[df_tpose['imu_id'] == imu_id].sort_values('timestamp')
-        
-        # Select stable window: Skip first 10 frames, take next 50
-        # If not enough data, take what we have after skipping
-        start_idx = 10
-        end_idx = 60
-        
-        if len(imu_data) > start_idx:
-            subset = imu_data.iloc[start_idx:min(end_idx, len(imu_data))]
-        else:
-            subset = imu_data # Fallback if very short
-            
-        if len(subset) == 0:
-            print(f"Warning: No data found for IMU {imu_id} in specified window!")
-            continue
-            
-        avg_roll = subset['roll'].mean()
-        avg_pitch = subset['pitch'].mean()
-        avg_yaw = subset['yaw'].mean()
-        R_meas = euler_to_rotation_matrix(avg_roll, avg_pitch, avg_yaw)
-        
-        # We want: R_meas @ R_offset = I (Identity)
-        # So: R_offset = R_meas^T
-        R_offset = R_meas.T
-        offsets[int(imu_id)] = R_offset
-        
-    print("Calibration offsets computed (Target: Identity).")
-    return offsets
-
-def apply_coordinate_transform(accel, rotation_matrix, imu_id, calibration_matrix=None):
-    """Apply coordinate transformation and optional calibration"""
+def apply_coordinate_transform(accel, rotation_matrix, imu_id):
+    """Apply coordinate transformation only"""
     transform = get_coordinate_transform(imu_id)
     
     # Transform acceleration vector: v_body = T @ v_sensor
@@ -145,19 +100,11 @@ def apply_coordinate_transform(accel, rotation_matrix, imu_id, calibration_matri
     # Transform rotation matrix: R_body = R_sensor @ T^T
     rotation_transformed = rotation_matrix @ transform.T
     
-    # Apply Calibration: R_final = R_transformed @ R_calib
-    if calibration_matrix is not None:
-        rotation_transformed = rotation_transformed @ calibration_matrix
-        # Note: We do not rotate acceleration by the calibration matrix because
-        # calibration aligns the sensor's mounting orientation to the bone frame,
-        # but the physical gravity vector (acceleration) is already in the correct 
-        # global frame after the initial coordinate transform.
-    
     return accel_transformed, rotation_transformed
 
-def fill_and_transform_data(csv_file, output_file, id2_avg=None, calibration_offsets=None):
+def fill_and_transform_data(csv_file, output_file, id2_avg=None):
     """
-    Fill missing IMU data in RAW format, then apply coordinate transformations and calibration
+    Fill missing IMU data in RAW format, then apply coordinate transformations
     """
     print(f"\nProcessing {csv_file}...")
     
@@ -204,7 +151,7 @@ def fill_and_transform_data(csv_file, output_file, id2_avg=None, calibration_off
     
     df_filled = pd.DataFrame(filled_data).sort_values(['timestamp', 'imu_id']).reset_index(drop=True)
     
-    # Step 2: Apply coordinate transformations and Calibration
+    # Step 2: Apply coordinate transformations
     transformed_data = []
     
     for idx, row in df_filled.iterrows():
@@ -212,14 +159,9 @@ def fill_and_transform_data(csv_file, output_file, id2_avg=None, calibration_off
         accel = np.array([row['accel_x'], row['accel_y'], row['accel_z']])
         rotation_matrix = euler_to_rotation_matrix(row['roll'], row['pitch'], row['yaw'])
         
-        # Get calibration matrix for this ID
-        calib_mat = None
-        if calibration_offsets and imu_id in calibration_offsets:
-            calib_mat = calibration_offsets[imu_id]
-            
         # Apply coordinate transformation
         accel_transformed, rotation_transformed = apply_coordinate_transform(
-            accel, rotation_matrix, imu_id, calib_mat
+            accel, rotation_matrix, imu_id
         )
         
         # Convert back to Euler angles
@@ -249,50 +191,33 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     
     print("="*70)
-    print("IMU Data Processing - Correct Version with Calibration")
+    print("IMU Data Processing - Coordinate Transform Only")
     print("="*70)
     print("\nCoordinate Transformations:")
     print("  IMU 0,3,4,5: Z-forward, X-up, Y-right → X-right, Y-up, Z-forward")
     print("  IMU 2 (left hand): X-left, Y-back, Z-up → X-right, Y-up, Z-forward")
     print("  IMU 1 (right hand): X-right, Y-forward, Z-up → X-right, Y-up, Z-forward")
-    print("  Calibration: All sensors aligned to Root orientation in T-pose (1.csv)")
     print("="*70)
     
-    # First Pass: Process 1.csv without calibration to get base T-pose data
-    print("\n[Phase 1] Analyzing 1.csv for Calibration...")
-    df1_base = fill_and_transform_data(
-        os.path.join(csv_dir, '1.csv'),
-        os.path.join(output_dir, '1_temp.csv'),
-        id2_avg=None,
-        calibration_offsets=None
-    )
-    
-    # Compute Calibration Offsets
-    calibration_offsets = compute_calibration_offsets(df1_base)
-    
-    # Prepare ID 2 average for filling
-    df1_raw = pd.read_csv(os.path.join(csv_dir, '1.csv'))
-    id2_avg_raw = df1_raw[df1_raw['imu_id'] == 2][['accel_x', 'accel_y', 'accel_z', 'roll', 'pitch', 'yaw']].mean()
-    
-    # Phase 2: Process all files WITH calibration
-    print("\n[Phase 2] Processing all files with Calibration...")
-    
     # Process 1.csv
-    print("\n[1/3] Processing 1.csv (Final)")
+    print("\n[1/3] Processing 1.csv")
     df1 = fill_and_transform_data(
         os.path.join(csv_dir, '1.csv'),
         os.path.join(output_dir, '1_final.csv'),
-        id2_avg=None,
-        calibration_offsets=calibration_offsets
+        id2_avg=None
     )
+    
+    # Prepare ID 2 average for filling subsequent files
+    # We use the raw data from 1.csv to fill missing sensor data in other files
+    df1_raw = pd.read_csv(os.path.join(csv_dir, '1.csv'))
+    id2_avg_raw_input = df1_raw[df1_raw['imu_id'] == 2][['accel_x', 'accel_y', 'accel_z', 'roll', 'pitch', 'yaw']].mean()
     
     # Process 2.csv
     print("\n[2/3] Processing 2.csv")
     df2 = fill_and_transform_data(
         os.path.join(csv_dir, '2.csv'),
         os.path.join(output_dir, '2_final.csv'),
-        id2_avg=id2_avg_raw,
-        calibration_offsets=calibration_offsets
+        id2_avg=id2_avg_raw_input
     )
     
     # Process 3.csv
@@ -300,8 +225,7 @@ def main():
     df3 = fill_and_transform_data(
         os.path.join(csv_dir, '3.csv'),
         os.path.join(output_dir, '3_final.csv'),
-        id2_avg=id2_avg_raw,
-        calibration_offsets=calibration_offsets
+        id2_avg=id2_avg_raw_input
     )
     
     print("\n" + "="*70)
